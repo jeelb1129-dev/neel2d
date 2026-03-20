@@ -1,9 +1,27 @@
 /**
  * Neel2D Character Renderer
  *
- * Background removal: flood-fill from edges (never touches internal white like the shirt).
- * Animations: subtle breathing scale, gentle float, eye-blink overlay, tiny talking bob.
+ * - Flood-fill background removal (never eats into shirt/skin)
+ * - Subtle breathing scale + gentle float (whole image, very calm)
+ * - Eye blink overlay positioned precisely on neel.png's eye area
+ * - Mouth open/close overlay when talking (no whole-image bobbing)
  */
+
+// ── Measured from neel.png (fractions of image dimensions) ───────────────────
+
+// Eye centres
+const L_EYE = { fx: 0.375, fy: 0.163 };
+const R_EYE = { fx: 0.555, fy: 0.163 };
+const EYE_RX = 0.048;   // half-width  as fraction of image width
+const EYE_RY = 0.014;   // half-height as fraction of image height
+const SKIN   = '#c48558'; // face skin colour for eyelids
+
+// Mouth centre
+const MOUTH   = { fx: 0.468, fy: 0.234 };
+const MOUTH_RX = 0.052;   // half-width  as fraction of image width
+const MOUTH_RY = 0.018;   // max half-height when fully open
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 export class CharacterRenderer {
     constructor(canvas) {
@@ -14,39 +32,32 @@ export class CharacterRenderer {
         this.expression  = 'relaxed';
         this.isTalking   = false;
 
-        // animation phases
+        // breathing / float
         this.breathPhase = 0;
         this.floatPhase  = 0;
-        this.talkPhase   = 0;
+
+        // mouth
+        this.talkPhase  = 0;
+        this.mouthOpen  = 0;  // 0–1
 
         // eye blink
-        this.blinkProgress = 0;        // 0 = open, 1 = fully closed
-        this.blinkTimer    = 2500 + Math.random() * 3500;
-        this.blinking      = false;
+        this.blinkProgress = 0;
+        this.blinkClosing  = false;
+        this.blinkTimer    = 2000 + Math.random() * 3000;
 
-        this.cleanCanvas  = null;
-        this.imgW = 0;
-        this.imgH = 0;
+        this.cleanCanvas = null;
 
         const img = new Image();
         img.src = '/neel.png';
-        img.onload = () => {
-            this.imgW = img.width;
-            this.imgH = img.height;
-            this.cleanCanvas = this._removeBackground(img);
-        };
+        img.onload = () => { this.cleanCanvas = this._removeBackground(img); };
 
         this.resize();
         window.addEventListener('resize', () => this.resize());
     }
 
-    /**
-     * Flood-fill background removal.
-     * Starts from all 4 edges and removes only pixels that are connected
-     * to the border AND near-white — so internal white (shirt, etc.) is safe.
-     */
+    /** Flood-fill background removal — safe for internal white areas. */
     _removeBackground(img) {
-        const W  = img.width, H = img.height;
+        const W = img.width, H = img.height;
         const oc = document.createElement('canvas');
         oc.width = W; oc.height = H;
         const octx = oc.getContext('2d');
@@ -54,57 +65,50 @@ export class CharacterRenderer {
 
         const id = octx.getImageData(0, 0, W, H);
         const d  = id.data;
-
-        const THRESH = 55; // strict: only clearly-white background pixels
-        const THRESH2 = THRESH * THRESH;
+        const T2 = 55 * 55;  // strict near-white threshold
 
         const isNearWhite = (pi) => {
             const b = pi * 4;
-            const dr = 255 - d[b], dg = 255 - d[b+1], db = 255 - d[b+2];
-            return dr*dr + dg*dg + db*db < THRESH2;
+            const dr = 255-d[b], dg = 255-d[b+1], db = 255-d[b+2];
+            return dr*dr + dg*dg + db*db < T2;
         };
 
-        const visited = new Uint8Array(W * H); // 1 = queued/removed
-
-        const queue = new Int32Array(W * H);
+        const visited = new Uint8Array(W * H);
+        const queue   = new Int32Array(W * H);
         let qHead = 0, qTail = 0;
 
         const enqueue = (pi) => {
-            if (pi >= 0 && pi < W * H && !visited[pi] && isNearWhite(pi)) {
+            if (pi >= 0 && pi < W*H && !visited[pi] && isNearWhite(pi)) {
                 visited[pi] = 1;
                 queue[qTail++] = pi;
             }
         };
 
-        // Seed from all 4 edges
-        for (let x = 0; x < W; x++) { enqueue(x); enqueue((H-1)*W + x); }
-        for (let y = 1; y < H-1; y++) { enqueue(y*W); enqueue(y*W + W-1); }
+        // Seed all 4 edges
+        for (let x = 0; x < W; x++) { enqueue(x); enqueue((H-1)*W+x); }
+        for (let y = 1; y < H-1; y++) { enqueue(y*W); enqueue(y*W+W-1); }
 
         // BFS
         while (qHead < qTail) {
             const pi = queue[qHead++];
-            d[pi*4 + 3] = 0; // transparent
-            const x = pi % W, y = (pi / W) | 0;
-            if (x > 0)   enqueue(pi - 1);
-            if (x < W-1) enqueue(pi + 1);
-            if (y > 0)   enqueue(pi - W);
-            if (y < H-1) enqueue(pi + W);
+            d[pi*4+3] = 0;
+            const x = pi%W, y = (pi/W)|0;
+            if (x>0)   enqueue(pi-1);
+            if (x<W-1) enqueue(pi+1);
+            if (y>0)   enqueue(pi-W);
+            if (y<H-1) enqueue(pi+W);
         }
 
-        // Feather: soften pixels that sit right next to removed background
-        for (let pi = 0; pi < W * H; pi++) {
+        // Feather pixels adjacent to removed background
+        for (let pi = 0; pi < W*H; pi++) {
             if (visited[pi] || d[pi*4+3] === 0) continue;
-            const x = pi % W, y = (pi / W) | 0;
-            const borderBg =
-                (x > 0   && visited[pi-1]) ||
-                (x < W-1 && visited[pi+1]) ||
-                (y > 0   && visited[pi-W]) ||
-                (y < H-1 && visited[pi+W]);
-            if (borderBg) {
-                const b = pi * 4;
+            const x = pi%W, y = (pi/W)|0;
+            if ((x>0 && visited[pi-1]) || (x<W-1 && visited[pi+1]) ||
+                (y>0 && visited[pi-W]) || (y<H-1 && visited[pi+W])) {
+                const b  = pi*4;
                 const dr = 255-d[b], dg = 255-d[b+1], db = 255-d[b+2];
                 const dist = Math.sqrt(dr*dr + dg*dg + db*db);
-                if (dist < 90) d[b+3] = Math.round((dist / 90) * d[b+3]);
+                if (dist < 85) d[b+3] = Math.round((dist/85) * d[b+3]);
             }
         }
 
@@ -127,24 +131,31 @@ export class CharacterRenderer {
     setTalking(val)      { this.isTalking  = val; }
 
     update(dt) {
-        this.breathPhase += dt * 0.0013;  // ~5 s cycle
-        this.floatPhase  += dt * 0.0009;  // ~7 s cycle
-        if (this.isTalking) this.talkPhase += dt * 0.007;
+        // Slow, calm breathing + float — no talking bob on whole image
+        this.breathPhase += dt * 0.0013;   // ~5 s cycle
+        this.floatPhase  += dt * 0.0009;   // ~7 s cycle
+
+        // Mouth open/close (smooth, only amplitude changes)
+        if (this.isTalking) {
+            this.talkPhase += dt * 0.008;
+            const target = (Math.sin(this.talkPhase * 3) * 0.5 + 0.5) * 0.85;
+            this.mouthOpen += (target - this.mouthOpen) * 0.25;
+        } else {
+            this.mouthOpen += (0 - this.mouthOpen) * 0.20;
+            this.talkPhase  = 0;
+        }
 
         // Eye blink
         this.blinkTimer -= dt;
-        if (!this.blinking && this.blinkTimer <= 0) {
-            this.blinking   = true;
-            this.blinkTimer = 2500 + Math.random() * 4000;
+        if (this.blinkTimer <= 0 && !this.blinkClosing && this.blinkProgress === 0) {
+            this.blinkClosing = true;
+            this.blinkTimer   = 2500 + Math.random() * 4000;
         }
-        if (this.blinking) {
-            this.blinkProgress += dt * 0.010; // close speed
-            if (this.blinkProgress >= 1) {
-                this.blinkProgress = 1;
-                this.blinking      = false;    // start opening
-            }
+        if (this.blinkClosing) {
+            this.blinkProgress += dt * 0.009;
+            if (this.blinkProgress >= 1) { this.blinkProgress = 1; this.blinkClosing = false; }
         } else if (this.blinkProgress > 0) {
-            this.blinkProgress -= dt * 0.012; // open speed (slightly faster)
+            this.blinkProgress -= dt * 0.011;
             if (this.blinkProgress < 0) this.blinkProgress = 0;
         }
     }
@@ -156,84 +167,86 @@ export class CharacterRenderer {
 
         const src = this.cleanCanvas;
 
-        // Fit to canvas
+        // Scale to fit — leave room for chat panel on the right
         const maxH  = h * 0.80;
         const maxW  = w * 0.44;
         const scale = Math.min(maxH / src.height, maxW / src.width);
         const drawW = src.width  * scale;
         const drawH = src.height * scale;
 
-        // Position: slightly left of centre
         const cx = w * 0.41;
         const cy = h * 0.50;
 
-        // ── subtle animations ──────────────────────────────────────────────
-        const breathScale = 1 + Math.sin(this.breathPhase) * 0.010; // ±1 %
-        const floatY      = Math.sin(this.floatPhase) * 3.5;         // ±3.5 px
-        const talkBob     = this.isTalking
-            ? Math.sin(this.talkPhase * 3) * 2.5   // ±2.5 px while speaking
-            : 0;
+        // Gentle breathing (scale only) and float (translate Y)
+        const breathScale = 1 + Math.sin(this.breathPhase) * 0.010;
+        const floatY      = Math.sin(this.floatPhase) * 3.5;
 
-        const finalScale = breathScale;
-        const finalY     = floatY + talkBob;
+        // Final image size after breath scale
+        const fW = drawW * breathScale;
+        const fH = drawH * breathScale;
+        // Top-left of drawn image in canvas coords (needed for overlays)
+        const imgX = cx - fW / 2;
+        const imgY = cy + floatY - fH / 2;
 
-        // Top-left corner of the drawn image in canvas space (used for blink overlay)
-        const imgX = cx - (drawW * finalScale) / 2;
-        const imgY = cy + finalY - (drawH * finalScale) / 2;
-        const iW   = drawW * finalScale;
-        const iH   = drawH * finalScale;
-
-        // ── draw character ─────────────────────────────────────────────────
+        // ── draw background-removed character ─────────────────────────────
         ctx.save();
-        ctx.translate(cx, cy + finalY);
-        ctx.scale(finalScale, finalScale);
-        ctx.drawImage(src, -drawW / 2, -drawH / 2, drawW, drawH);
+        ctx.translate(cx, cy + floatY);
+        ctx.scale(breathScale, breathScale);
+        ctx.drawImage(src, -drawW/2, -drawH/2, drawW, drawH);
         ctx.restore();
 
-        // ── eye blink overlay ──────────────────────────────────────────────
-        // Eyelid position is estimated as fractions of the drawn image size.
-        // Tuned for neel.png (full-body portrait, head in top ~30%).
+        // ── mouth overlay ─────────────────────────────────────────────────
+        if (this.mouthOpen > 0.01) {
+            const mx  = imgX + MOUTH.fx * fW;
+            const my  = imgY + MOUTH.fy * fH;
+            const rx  = MOUTH_RX * fW;
+            const ryO = MOUTH_RY * fH * this.mouthOpen; // open height
+
+            // Dark interior
+            ctx.save();
+            ctx.beginPath();
+            ctx.ellipse(mx, my, rx, Math.max(ryO, 1), 0, 0, Math.PI * 2);
+            ctx.fillStyle = '#2a0e06';
+            ctx.fill();
+
+            // Upper lip line (covers the original smile line)
+            ctx.beginPath();
+            ctx.ellipse(mx, my - ryO * 0.4, rx * 1.05, ryO * 0.35 + 1, 0, Math.PI, Math.PI * 2);
+            ctx.fillStyle = '#8b4a2a';
+            ctx.fill();
+
+            // Lower lip
+            ctx.beginPath();
+            ctx.ellipse(mx, my + ryO * 0.5, rx * 0.95, ryO * 0.30 + 1, 0, 0, Math.PI);
+            ctx.fillStyle = '#8b4a2a';
+            ctx.fill();
+            ctx.restore();
+        }
+
+        // ── eye blink overlay ─────────────────────────────────────────────
         if (this.blinkProgress > 0.01) {
-            this._drawBlink(ctx, imgX, imgY, iW, iH, this.blinkProgress);
+            const p = this.blinkProgress;
+            ctx.save();
+            ctx.fillStyle = SKIN;
+
+            for (const eye of [L_EYE, R_EYE]) {
+                const ex  = imgX + eye.fx * fW;
+                const ey  = imgY + eye.fy * fH;
+                const rx  = EYE_RX * fW;
+                const ryF = EYE_RY * fH;  // full open half-height
+
+                // Upper lid sweeps down
+                ctx.beginPath();
+                ctx.ellipse(ex, ey - ryF + ryF * p, rx, ryF * p + 0.5, 0, 0, Math.PI * 2);
+                ctx.fill();
+
+                // Lower lid sweeps up
+                ctx.beginPath();
+                ctx.ellipse(ex, ey + ryF - ryF * p * 0.5, rx, ryF * p * 0.5 + 0.5, 0, 0, Math.PI * 2);
+                ctx.fill();
+            }
+            ctx.restore();
         }
-    }
-
-    /**
-     * Draw skin-coloured eyelid strips that descend to cover the eyes.
-     * Eye positions are expressed as fractions of the drawn image dimensions.
-     */
-    _drawBlink(ctx, imgX, imgY, iW, iH, p) {
-        // Approximate eye metrics for neel.png
-        // Tweak fy/fw/fh if the eyelids land in the wrong place.
-        const eyes = [
-            { fx: 0.355, fy: 0.210 },  // left eye centre
-            { fx: 0.560, fy: 0.210 },  // right eye centre
-        ];
-        const eyeW = iW * 0.105;  // eye ellipse width
-        const eyeH = iH * 0.028;  // eye ellipse half-height (open)
-
-        ctx.save();
-        // Use the skin tone that matches neel.png's face
-        ctx.fillStyle = '#c48055';
-
-        for (const eye of eyes) {
-            const ex = imgX + eye.fx * iW;
-            const ey = imgY + eye.fy * iH;
-
-            // Upper lid sweeps down; lower lid sweeps up — meet in the middle
-            const lidH = eyeH * p;
-
-            ctx.beginPath();
-            // Upper lid: rectangle + rounded bottom
-            ctx.ellipse(ex, ey - eyeH + lidH, eyeW / 2, lidH + 1, 0, 0, Math.PI * 2);
-            ctx.fill();
-
-            // Lower lid (smaller, just closes the bottom gap)
-            ctx.beginPath();
-            ctx.ellipse(ex, ey + eyeH - lidH * 0.4, eyeW / 2, lidH * 0.4 + 1, 0, 0, Math.PI * 2);
-            ctx.fill();
-        }
-        ctx.restore();
     }
 
     render(timestamp) {
